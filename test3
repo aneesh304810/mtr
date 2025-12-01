@@ -1,0 +1,565 @@
+import streamlit as st
+import textwrap
+import pandas as pd
+import json
+import random # Used for simulating test results
+
+# --- Configuration for Streamlit App ---
+st.set_page_config(
+    page_title="dbt Project Generator IDE",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- Session State Initialization ---
+# Initialize session state for all project components to persist data across tabs
+if 'project_name' not in st.session_state: st.session_state.project_name = "analytics_project"
+if 'profile_name' not in st.session_state: st.session_state.profile_name = "default_profile"
+if 'target_schema' not in st.session_state: st.session_state.target_schema = "public"
+if 'df_sources' not in st.session_state:
+    # FIX APPLIED: Ensure all arrays have the same length (2) for DataFrame initialization.
+    st.session_state.df_sources = pd.DataFrame({
+        'source_name': ['raw_data', 'raw_data'], 
+        'table_name': ['users', 'orders'],
+        'description': ['Raw data from application database', 'Raw transactional orders'],
+        'loaded_at_field': ['_loaded_at', 'created_at']
+    })
+if 'df_schema' not in st.session_state:
+    st.session_state.df_schema = pd.DataFrame({
+        'name': ['customer_id', 'first_name', 'email'],
+        'description': ['Primary key', 'Customer first name', 'Email address'],
+        'not_null': [True, True, False],
+        'unique': [True, False, False],
+        'accepted_values': ['', '', '']
+    })
+if 'model_name' not in st.session_state: st.session_state.model_name = "stg_customers"
+if 'model_description' not in st.session_state: st.session_state.model_description = "Cleaned and standardized customer data."
+if 'sql_logic' not in st.session_state:
+    st.session_state.sql_logic = textwrap.dedent("""
+    SELECT
+        id as customer_id,
+        first_name,
+        last_name,
+        email,
+        created_at,
+        updated_at
+    FROM {{{{ source('raw_data', 'users') }}}}
+    WHERE is_active = TRUE
+    """).strip()
+if 'materialization_type' not in st.session_state: st.session_state.materialization_type = 'View'
+if 'unique_key' not in st.session_state: st.session_state.unique_key = ""
+
+
+# --- Presets (Tutorial Examples) ---
+PRESETS = {
+    "Select an Example": {
+        "model_name": "stg_customers",
+        "model_description": "Cleaned and standardized customer data.",
+        "sql": textwrap.dedent("""
+        SELECT
+            id as customer_id,
+            first_name,
+            last_name,
+            email,
+            created_at,
+            updated_at
+        FROM {{{{ source('raw_data', 'users') }}}}
+        WHERE is_active = TRUE
+        """).strip(),
+        "schema": {
+            'name': ['customer_id', 'first_name', 'email', 'updated_at'],
+            'description': ['Primary key for customer', 'Customer first name', 'Email address', 'Last updated timestamp'],
+            'not_null': [True, True, True, True],
+            'unique': [True, False, False, False],
+            'accepted_values': ['', '', '', '']
+        },
+        "sources": {
+            'source_name': ['raw_data', 'raw_data'],
+            'table_name': ['users', 'orders'],
+            'description': ['Raw data from application database', 'Raw transactional orders'],
+            'loaded_at_field': ['_loaded_at', 'created_at']
+        }
+    },
+}
+
+# --- Utility Functions for File Generation ---
+
+def generate_dbt_project_yml(project_name, profile_name):
+    """Generates dbt_project.yml content."""
+    return textwrap.dedent(f"""
+{project_name}:
+  target-path: "target"
+  clean-targets:
+    - "target"
+    - "dbt_packages"
+  
+  profile: "{profile_name}"
+  version: 1.0
+
+  models:
+    {project_name}:
+      materialized: view
+      staging:
+        schema: stg
+        materialized: view
+      marts:
+        schema: marts
+        materialized: table
+""").strip()
+
+def generate_sources_yml(df_sources):
+    """Generates sources.yml content from DataFrame."""
+    yml_content = "version: 2\n\nsources:\n"
+
+    grouped = df_sources.groupby('source_name')
+
+    for source_name, tables in grouped:
+        # Check if description and loaded_at_field are present and valid for the group
+        source_description = tables['description'].iloc[0] if not tables['description'].isnull().all() else f"External data source: {source_name}"
+        source_loaded_at = tables['loaded_at_field'].iloc[0] if not tables['loaded_at_field'].isnull().all() else 'null'
+
+        yml_content += f"""
+  - name: {source_name}
+    description: "{source_description}"
+    loaded_at_field: "{source_loaded_at}"
+    tables:
+"""
+        for index, row in tables.iterrows():
+            yml_content += f"""
+      - name: {row['table_name']}
+        description: "{row['description']}"
+"""
+
+    return textwrap.dedent(yml_content).strip()
+
+def generate_dbt_model_sql(model_name, description, sql_logic, materialization_type, unique_key=None):
+    """Generates the content for the dbt .sql file with full config."""
+    config_lines = [f"    materialized='{materialization_type.lower()}'"]
+    if materialization_type == 'Incremental' and unique_key:
+        config_lines.append(f"    unique_key='{unique_key}'")
+    
+    config_block = ",\n".join(config_lines)
+
+    sql_template = f"""
+-- dbt Model: {model_name}
+-- Description: {description}
+-- Path: models/staging/{model_name}.sql
+
+{{{{ config(
+{config_block}
+) }}}}
+
+-- Incremental Logic (only applies if materialized='incremental')
+{{% if is_incremental() %}}
+    -- **IMPORTANT:** Change 'updated_at' to your actual incremental column name.
+    WHERE updated_at > (SELECT MAX(updated_at) FROM {{{{ this }}}} )
+{{% endif %}}
+
+-- Core SQL Transformation Logic
+{sql_logic}
+"""
+    return textwrap.dedent(sql_template).strip()
+
+def generate_dbt_model_yml(model_name, description, df_schema):
+    """Generates the content for the dbt .yml file (schema) from a DataFrame."""
+    yml_content = f"""
+models:
+  - name: {model_name}
+    description: "{description}"
+    columns:
+"""
+    for index, row in df_schema.iterrows():
+        col_name = row['name']
+        col_desc = row['description']
+        
+        # Build tests block
+        tests_list = []
+        if row['not_null']:
+            tests_list.append("          - not_null")
+        if row['unique']:
+            tests_list.append("          - unique")
+        
+        accepted_values = row['accepted_values'].strip()
+        if accepted_values:
+            values = [v.strip() for v in accepted_values.split(',')]
+            tests_list.append(f"          - accepted_values:\n              values: {values}")
+
+        tests_block = ""
+        if tests_list:
+            tests_block = "\n        tests:\n" + "\n".join(tests_list)
+        
+        yml_content += f"""
+      - name: {col_name}
+        description: "{col_desc}"{tests_block}
+"""
+    return textwrap.dedent(f"version: 2\n\n{yml_content}").strip()
+
+# --- Tab Content Functions ---
+
+def render_lineage_graph(model_name):
+    """Simulates a dbt lineage graph."""
+    st.subheader("Simulated Data Lineage Graph")
+    st.markdown("This graph shows how data flows from sources through models in your project.")
+    
+    # Mock graph data structure
+    nodes = [
+        ('A', 'Source: raw_data.users', 'source'),
+        ('B', model_name, 'staging'),
+        ('C', 'Mart: dim_customers', 'mart'),
+        ('D', 'Mart: fct_orders', 'mart'),
+    ]
+    edges = [
+        ('A', 'B'),
+        ('B', 'C'),
+        ('B', 'D'),
+    ]
+    
+    # Format for simple visual display (could be used for graphviz or similar library)
+    graph_text = ""
+    for u, v in edges:
+        source_name = next(n[1] for n in nodes if n[0] == u)
+        target_name = next(n[1] for n in nodes if n[0] == v)
+        graph_text += f"[{source_name}] --> [{target_name}]\n"
+        
+    st.code(graph_text, language="mermaid") 
+    
+    st.markdown(f"""
+    ***
+    **Lineage Insight:** The model **`dim_customers`** and **`fct_orders`** both depend on the staging model **`{model_name}`**. 
+    Any change to the staging model will affect both downstream mart models.
+    """)
+
+def render_testing_dashboard(df_schema):
+    """Simulates a dbt test results dashboard."""
+    st.subheader("Simulated Test Results Dashboard")
+    st.markdown(f"Test results based on the schema defined for **`{st.session_state.model_name}`**.")
+    
+    if df_schema.empty:
+        st.warning("No columns defined in the Model Schema tab to run tests on.")
+        return
+
+    # Aggregate all active tests
+    total_tests = 0
+    test_results = []
+    
+    for index, row in df_schema.iterrows():
+        col_name = row['name']
+        
+        # Check and simulate results for unique test
+        if row['unique']:
+            total_tests += 1
+            is_pass = random.choices([True, False], weights=[0.95, 0.05], k=1)[0]
+            test_results.append({
+                'column': col_name,
+                'test_type': 'unique',
+                'status': '✅ PASS' if is_pass else '❌ FAIL',
+                'failure_count': 0 if is_pass else random.randint(1, 10)
+            })
+
+        # Check and simulate results for not_null test
+        if row['not_null']:
+            total_tests += 1
+            is_pass = random.choices([True, False], weights=[0.90, 0.10], k=1)[0]
+            test_results.append({
+                'column': col_name,
+                'test_type': 'not_null',
+                'status': '✅ PASS' if is_pass else '❌ FAIL',
+                'failure_count': 0 if is_pass else random.randint(5, 20)
+            })
+            
+        # Check and simulate results for accepted_values test
+        if row['accepted_values'].strip():
+            total_tests += 1
+            is_pass = random.choices([True, False], weights=[0.85, 0.15], k=1)[0]
+            test_results.append({
+                'column': col_name,
+                'test_type': 'accepted_values',
+                'status': '✅ PASS' if is_pass else '❌ FAIL',
+                'failure_count': 0 if is_pass else random.randint(1, 5)
+            })
+
+    
+    # Calculate summary metrics
+    failed_tests = sum(1 for res in test_results if 'FAIL' in res['status'])
+    passed_tests = total_tests - failed_tests
+
+    col_pass, col_fail, col_total = st.columns(3)
+    col_pass.metric("Tests Passed", passed_tests, delta_color="normal")
+    col_fail.metric("Tests Failed", failed_tests, delta_color="inverse")
+    col_total.metric("Total Tests Run", total_tests)
+
+    st.markdown("### Detailed Test Results")
+    st.dataframe(pd.DataFrame(test_results), hide_index=True, use_container_width=True)
+
+# --- Streamlit UI Layout ---
+st.title("dbt Project Generator IDE ☁️")
+st.markdown("A complete interface to scaffold, define, and document your dbt project.")
+
+# --- Tab Setup ---
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🎯 Tutorial",
+    "⚙️ Project Setup",
+    "🔗 Sources",
+    "💻 Model & Schema",
+    "📊 Testing & Lineage",
+    "📦 Final Project Files"
+])
+
+
+# --- Tab 1: Tutorial ---
+with tab1:
+    st.header("dbt Project Tutorial: Staging Model Example")
+    
+    st.markdown("""
+    This generator walks you through the essential steps of building a dbt project:
+    
+    1.  **Project Setup (`dbt_project.yml`):** Defines the project name and configuration (Tab 2).
+    2.  **Source Definition (`sources.yml`):** Tells dbt where your raw data lives (Tab 3).
+    3.  **Model Building (`.sql`):** Contains your core SQL transformations (Tab 4).
+    4.  **Documentation & Testing (`models.yml`):** Defines schema, descriptions, and data quality tests (Tab 4).
+    
+    ### Step-by-Step Example: Building a Staging Customer Model
+    
+    We will build a simple staging model (`stg_customers`) that cleans up raw user data from a source named `raw_data`.
+    """)
+    
+    if st.button("Load 'stg_customers' Tutorial Example"):
+        preset_data = PRESETS["Select an Example"]
+        st.session_state.model_name = preset_data['model_name']
+        st.session_state.model_description = preset_data['model_description']
+        st.session_state.sql_logic = preset_data['sql'].strip()
+        st.session_state.df_schema = pd.DataFrame(preset_data['schema'])
+        st.session_state.df_sources = pd.DataFrame(preset_data['sources'])
+        st.session_state.materialization_type = 'View'
+        st.session_state.unique_key = 'customer_id'
+        st.success("Tutorial example loaded! Navigate through the tabs (Sources, Model & Schema) to see the pre-filled data.")
+    
+    st.subheader("1. Source Usage in SQL")
+    st.markdown("""
+    Instead of writing `FROM raw_data.users`, dbt encourages using Jinja references for sources:
+    
+    ```sql
+    FROM {{{{ source('raw_data', 'users') }}}}
+    ```
+    This provides lineage tracking and better portability.
+    """)
+    
+    st.subheader("2. Documentation via YAML")
+    st.markdown("""
+    The `models.yml` file is crucial. It adds descriptions to models and columns (used in `dbt docs`) and defines data quality **tests** (`unique`, `not_null`, etc.).
+    """)
+    st.info("Now, move to the **⚙️ Project Setup** tab to define project variables, then **🔗 Sources** and **💻 Model & Schema** to build the files.")
+
+
+# --- Tab 2: Project Setup ---
+with tab2:
+    st.header("Configure dbt Project (`dbt_project.yml`)")
+    st.markdown("Define the name, profile, and basic configuration for your dbt project.")
+    
+    colA, colB = st.columns(2)
+    with colA:
+        st.session_state.project_name = st.text_input(
+            "Project Name (directory name)",
+            st.session_state.project_name,
+            key="project_name_input"
+        ).lower().replace(' ', '_')
+        
+    with colB:
+        st.session_state.profile_name = st.text_input(
+            "Profile Name (must match your `profiles.yml`)",
+            st.session_state.profile_name,
+            key="profile_name_input"
+        )
+    
+    st.subheader("Project File Structure")
+    st.markdown("""
+    When you initialize a dbt project, it creates a specific file structure. Your generated files will fit into this structure.
+    """)
+    # Image placeholder removed to fix NameError
+    
+    st.subheader("Generated `dbt_project.yml`")
+    st.code(generate_dbt_project_yml(st.session_state.project_name, st.session_state.profile_name), language="yaml")
+
+
+# --- Tab 3: Sources ---
+with tab3:
+    st.header("Define External Sources (`models/sources.yml`)")
+    st.markdown("""
+    Sources tell dbt about the tables in your external data warehouse (e.g., Snowflake, BigQuery).
+    You can define multiple tables per source and configure freshness checks.
+    """)
+    
+    st.subheader("Source Table Editor")
+    st.markdown("Use this table to define all the raw tables you need to reference with `{{ source(...) }}`.")
+    
+    # Ensure all columns are present before editing
+    current_df_sources = st.session_state.df_sources
+    required_cols = ['source_name', 'table_name', 'description', 'loaded_at_field']
+    for col in required_cols:
+        if col not in current_df_sources.columns:
+            current_df_sources[col] = ""
+
+    st.session_state.df_sources = st.data_editor(
+        current_df_sources,
+        num_rows="dynamic",
+        column_config={
+            "source_name": st.column_config.TextColumn("Source Name", required=True),
+            "table_name": st.column_config.TextColumn("Table Name", required=True),
+            "description": st.column_config.TextColumn("Description", required=True),
+            "loaded_at_field": st.column_config.TextColumn("Loaded At Field", required=True, help="Column used for source freshness checks.")
+        },
+        height=250,
+        key="source_editor"
+    )
+    
+    if not st.session_state.df_sources.empty:
+        st.subheader("Generated `sources.yml`")
+        st.code(generate_sources_yml(st.session_state.df_sources), language="yaml")
+    else:
+        st.info("Define at least one source table to generate the `sources.yml` file.")
+
+
+# --- Tab 4: Model & Schema ---
+with tab4:
+    st.header("Build Model SQL and Schema")
+    st.markdown("Create the transformation logic and column documentation for a single model.")
+
+    colC, colD = st.columns(2)
+
+    with colC:
+        st.subheader("Model Definition & Config")
+        st.session_state.model_name = st.text_input(
+            "Model Name (e.g., 'stg_customers')",
+            st.session_state.model_name,
+            key="model_name_input_tab4"
+        ).lower().replace(' ', '_')
+
+        st.session_state.model_description = st.text_area(
+            "Model Description (for documentation)",
+            st.session_state.model_description,
+            height=100,
+            key="model_description_input_tab4"
+        )
+        
+        st.session_state.materialization_type = st.radio(
+            "Materialization Type:",
+            ('View', 'Table', 'Incremental'),
+            index=['View', 'Table', 'Incremental'].index(st.session_state.materialization_type),
+            horizontal=True,
+            key="materialization_type_input"
+        )
+
+        st.session_state.unique_key = ""
+        if st.session_state.materialization_type == 'Incremental':
+            st.session_state.unique_key = st.text_input(
+                "Unique Key (required for incremental models)",
+                st.session_state.get('unique_key', 'id'),
+                help="The column(s) used to uniquely identify records for merging.",
+                key="unique_key_input"
+            )
+
+    with colD:
+        st.subheader("Core SQL Logic")
+        st.session_state.sql_logic = st.text_area(
+            "SELECT Statement (Use `{{ source(...) }}` or `{{ ref(...) }}`)",
+            st.session_state.sql_logic,
+            height=300,
+            key="sql_logic_input_tab4"
+        )
+
+    st.subheader("Schema Editor (`models.yml`)")
+    st.markdown("""
+    Define the output columns, descriptions, and data quality tests. This generates the YAML for your documentation.
+    """)
+    
+    # Ensure all required columns are present before editing
+    current_df_schema = st.session_state.df_schema
+    required_schema_cols = ['name', 'description', 'not_null', 'unique', 'accepted_values']
+    for col in required_schema_cols:
+        if col not in current_df_schema.columns:
+            current_df_schema[col] = "" if col not in ['not_null', 'unique'] else False
+
+    st.session_state.df_schema = st.data_editor(
+        current_df_schema,
+        num_rows="dynamic",
+        column_config={
+            "name": st.column_config.TextColumn("Column Name", required=True),
+            "description": st.column_config.TextColumn("Description", required=True),
+            "not_null": st.column_config.CheckboxColumn("Not Null Test?"),
+            "unique": st.column_config.CheckboxColumn("Unique Test?"),
+            "accepted_values": st.column_config.TextColumn("Accepted Values (comma-sep)")
+        },
+        height=250,
+        key="model_schema_editor"
+    )
+
+    if st.button("Generate Model Files"):
+        try:
+            st.session_state.generated_sql = generate_dbt_model_sql(
+                st.session_state.model_name,
+                st.session_state.model_description,
+                st.session_state.sql_logic,
+                st.session_state.materialization_type,
+                st.session_state.unique_key
+            )
+            st.session_state.generated_yml = generate_dbt_model_yml(
+                st.session_state.model_name,
+                st.session_state.model_description,
+                st.session_state.df_schema
+            )
+            st.success("Model and Schema files generated! Check the 'Final Project Files' tab.")
+            
+            # Display results immediately
+            st.subheader(f"Generated SQL: `{st.session_state.model_name}.sql`")
+            st.code(st.session_state.generated_sql, language="sql")
+
+        except Exception as e:
+            st.error(f"Error during file generation: {e}")
+
+
+# --- Tab 5: Testing & Lineage ---
+with tab5:
+    st.header("dbt Test & Lineage Simulation")
+    st.markdown("This tab simulates the results you would see after running `dbt test` and using the dbt Docs Lineage Graph.")
+
+    colE, colF = st.columns(2)
+    
+    with colE:
+        render_testing_dashboard(st.session_state.df_schema)
+        
+    with colF:
+        render_lineage_graph(st.session_state.model_name)
+
+
+# --- Tab 6: Final Project Files ---
+with tab6:
+    st.header("Project File Structure Overview")
+    st.markdown(f"Here are all the files generated for the **`{st.session_state.project_name}`** project, ready to be copied into your dbt directory.")
+    
+    st.subheader("1. Root File: `dbt_project.yml`")
+    st.info("Place this file in the root of your new dbt project folder.")
+    st.code(generate_dbt_project_yml(st.session_state.project_name, st.session_state.profile_name), language="yaml")
+
+    st.subheader("2. Sources File: `models/sources.yml`")
+    st.info("Place this file in your `models/` directory.")
+    st.code(generate_sources_yml(st.session_state.df_sources), language="yaml")
+
+    if 'generated_sql' in st.session_state:
+        st.subheader(f"3. Model SQL File: `models/staging/{st.session_state.model_name}.sql`")
+        st.info("Place this file in the `models/staging/` directory.")
+        st.code(st.session_state.generated_sql, language="sql")
+
+        st.subheader(f"4. Model Schema File: `models/staging/schema.yml`")
+        st.info("Place this file in the `models/staging/` directory to document and test your model.")
+        st.code(st.session_state.generated_yml, language="yaml")
+    else:
+        st.warning("Please navigate to the '💻 Model & Schema' tab and click 'Generate Model Files' first.")
+
+    st.subheader("Summary of Actions")
+    st.markdown(f"""
+    1.  Create a folder named **`{st.session_state.project_name}`**.
+    2.  Place **`dbt_project.yml`** inside.
+    3.  Create a folder structure **`{st.session_state.project_name}/models/staging`**.
+    4.  Place the **`sources.yml`**, **`schema.yml`**, and **`{st.session_state.model_name}.sql`** files inside `models/staging`.
+    5.  Run `dbt run` and `dbt test` in your actual environment to build and test your models!
+    """)
